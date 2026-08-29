@@ -183,14 +183,20 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
     start = 0
     while start < duration:
         end = min(start + CHUNK_SIZE_SECONDS, duration)
+        window_end = min(end + CHUNK_OVERLAP_SECONDS, duration)
         chunk_segs = [
-            s for s in segments
-            if s["start"] >= start and s["end"] <= end + CHUNK_OVERLAP_SECONDS
+            {
+                **s,
+                "start": float(s["start"]) - start,
+                "end": float(s["end"]) - start,
+            }
+            for s in segments
+            if s["start"] >= start and s["end"] <= window_end
         ]
         if chunk_segs:
             chunk = dict(transcript)
             chunk["segments"] = chunk_segs
-            chunk["duration"] = end - start
+            chunk["duration"] = window_end - start
             chunk["_offset"] = start
             chunks.append(chunk)
         start += CHUNK_SIZE_SECONDS - CHUNK_OVERLAP_SECONDS
