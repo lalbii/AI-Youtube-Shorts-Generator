@@ -16,6 +16,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from shorts_generator import generate_shorts
+from shorts_generator.local.clipper import CROP_MODES
 
 
 def main() -> int:
@@ -31,6 +32,12 @@ def main() -> int:
     parser.add_argument("--aspect-ratio", default="9:16", help="Output aspect ratio (default: 9:16)")
     parser.add_argument("--format", default="720", help="Source download resolution: 360 / 480 / 720 / 1080 (default: 720)")
     parser.add_argument("--language", default=None, help="Force Whisper language code, e.g. 'en' (default: auto-detect)")
+    parser.add_argument(
+        "--crop-mode",
+        choices=CROP_MODES,
+        default="face",
+        help="Local render layout (default: face; ignored in API mode)",
+    )
     parser.add_argument("--output-json", default=None, help="Write the full result JSON to this path")
     args = parser.parse_args()
 
@@ -42,6 +49,7 @@ def main() -> int:
             download_format=args.format,
             language=args.language,
             mode=args.mode,
+            crop_mode=args.crop_mode,
         )
     except Exception as e:
         print(f"\nFAILED: {e}", file=sys.stderr)
