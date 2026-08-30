@@ -16,7 +16,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from shorts_generator import generate_shorts
-from shorts_generator.local.clipper import CROP_MODES
+CROP_MODES = ("center", "static-face", "face", "fit-blur")
 
 
 def main() -> int:
@@ -28,7 +28,7 @@ def main() -> int:
         default="api",
         help="api (default, MuAPI) or local (remote URL, file://, or local path + faster-whisper + LLM provider + ffmpeg).",
     )
-    parser.add_argument("--num-clips", type=int, default=3, help="How many shorts to render (default: 3)")
+    parser.add_argument("--num-clips", type=int, default=3, help="How many clips to select (default: 3)")
     parser.add_argument("--aspect-ratio", default="9:16", help="Output aspect ratio (default: 9:16)")
     parser.add_argument("--format", default="720", help="Source download resolution: 360 / 480 / 720 / 1080 (default: 720)")
     parser.add_argument("--language", default=None, help="Force Whisper language code, e.g. 'en' (default: auto-detect)")
@@ -38,7 +38,12 @@ def main() -> int:
         default="face",
         help="Local render layout (default: face; ignored in API mode)",
     )
-    parser.add_argument("--output-json", default=None, help="Write the full result JSON to this path")
+    parser.add_argument("--output-json", default="clip_final.json", help="Write the full selection JSON to this path (default: clip_final.json)")
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Render selected clips after writing the selection JSON. Disabled by default.",
+    )
     args = parser.parse_args()
 
     try:
@@ -50,6 +55,7 @@ def main() -> int:
             language=args.language,
             mode=args.mode,
             crop_mode=args.crop_mode,
+            render=args.render,
         )
     except Exception as e:
         print(f"\nFAILED: {e}", file=sys.stderr)
@@ -60,22 +66,23 @@ def main() -> int:
     print(f"Source video:  {result['source_video_url']}")
     print(
         f"Highlights:    {len(result.get('candidates', result['highlights']))} candidates "
-        f"→ {len(result['shorts'])} publishable"
+        f"→ {len(result['highlights'])} publishable"
     )
     print("=" * 72)
-    for i, s in enumerate(result["shorts"], 1):
+    selected = result["shorts"] if args.render else result["highlights"]
+    for i, s in enumerate(selected, 1):
         print(f"\n#{i}  score={s.get('score')}  {s.get('start_time'):.1f}s → {s.get('end_time'):.1f}s")
         print(f"     title:  {s.get('title')}")
         print(f"     hook:   {s.get('hook_sentence')}")
-        if s.get("clip_url"):
-            print(f"     clip:   {s['clip_url']}")
-        else:
-            print(f"     clip:   FAILED ({s.get('error')})")
+        if args.render:
+            if s.get("clip_url"):
+                print(f"     clip:   {s['clip_url']}")
+            else:
+                print(f"     clip:   FAILED ({s.get('error')})")
 
-    if args.output_json:
-        with open(args.output_json, "w") as f:
-            json.dump(result, f, indent=2)
-        print(f"\nFull JSON written to {args.output_json}")
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"\nSelection JSON written to {args.output_json}")
 
     return 0
 

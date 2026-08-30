@@ -199,19 +199,26 @@ class LongVideoChunkingTests(unittest.TestCase):
                 return '{"highlights":[{"title":"first","start_time":10,"end_time":50,"score":80}]}'
             if len(prompts) == 3:
                 return '{"highlights":[{"title":"second","start_time":10,"end_time":50,"score":90}]}'
-            return json.dumps({"judgments": [
-                {"candidate_id": "candidate_000", **judgment(10.0, 50.0, topic_key="first")},
-                {"candidate_id": "candidate_001", **judgment(1150.0, 1190.0, topic_key="second")},
+            if len(prompts) == 4:
+                return json.dumps({"judgments": [
+                    {"candidate_id": "candidate_000", **judgment(10.0, 50.0, topic_key="first")},
+                    {"candidate_id": "candidate_001", **judgment(1150.0, 1190.0, topic_key="second")},
+                ]})
+            return json.dumps({"reviews": [
+                {"candidate_id": "candidate_000", "start_ok": True, "end_ok": True, "needs_repair": False, "proposed_start_time": 10.0, "proposed_end_time": 50.0, "reason": "clean"},
+                {"candidate_id": "candidate_001", "start_ok": True, "end_ok": True, "needs_repair": False, "proposed_start_time": 1150.0, "proposed_end_time": 1190.0, "reason": "clean"},
             ]})
 
         result = get_highlights(transcript, num_clips=2, llm_fn=fake_llm)
 
-        self.assertEqual(4, len(prompts))
+        self.assertEqual(5, len(prompts))
         self.assertIn("Return approximately 5 candidates", prompts[1])
         self.assertIn("Return approximately 5 candidates", prompts[2])
         self.assertIn("[10.00s - 20.00s] Thought 10.", prompts[2])
         self.assertNotIn("[1150.00s", prompts[2])
         self.assertIn('"proposed_start_time": 1150.0', prompts[3])
+        self.assertIn("final semantic-boundary critic", prompts[4])
+        self.assertNotIn("Candidates and transcript evidence", prompts[4])
         second = next(item for item in result["candidates"] if item["title"] == "second")
         self.assertEqual(1150.0, second["start_time"])
         self.assertEqual(1190.0, second["end_time"])
