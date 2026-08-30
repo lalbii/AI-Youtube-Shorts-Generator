@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import main as cli
+from scripts.render_selected import load_selected_highlights
 from shorts_generator import pipeline
 
 
@@ -31,7 +32,7 @@ def fake_result(render=False):
         "transcript": {"segments": []},
         "candidates": [{"candidate_id": "candidate_001"}],
         "highlights": [dict(HIGHLIGHT)],
-        "shorts": [rendered] if render else [],
+        "shorts": [rendered] if render else [dict(HIGHLIGHT)],
     }
 
 
@@ -60,33 +61,39 @@ class MainRenderFlagTests(unittest.TestCase):
                     exit_code = cli.main()
             finally:
                 os.chdir(previous_cwd)
+            consumed = load_selected_highlights(output_json)
             return (
                 exit_code,
                 calls,
                 json.loads(output_json.read_text(encoding="utf-8")),
                 stdout.getvalue(),
                 list(root.rglob("*.mp4")),
+                consumed,
             )
 
     def test_default_writes_json_without_rendering_or_fake_clip_path(self):
-        exit_code, calls, result, output, mp4s = self.invoke([])
+        exit_code, calls, result, output, mp4s, consumed = self.invoke([])
         self.assertEqual(0, exit_code)
         self.assertFalse(calls[0]["render"])
-        self.assertEqual([], result["shorts"])
+        self.assertTrue(result["highlights"])
+        self.assertTrue(result["shorts"])
+        self.assertEqual(result["highlights"], result["shorts"])
         self.assertEqual([], mp4s)
         self.assertNotIn("clip:", output)
         self.assertIn("Selection JSON written to", output)
         self.assertIn("Selected insight", output)
 
+        self.assertEqual(result["highlights"], consumed)
+
     def test_render_flag_invokes_existing_render_path_and_prints_real_clip(self):
-        exit_code, calls, result, output, _ = self.invoke(["--render"])
+        exit_code, calls, result, output, _, _ = self.invoke(["--render"])
         self.assertEqual(0, exit_code)
         self.assertTrue(calls[0]["render"])
         self.assertEqual("output/short_01.mp4", result["shorts"][0]["clip_url"])
         self.assertIn("clip:   output/short_01.mp4", output)
 
     def test_render_specific_flags_do_not_enable_rendering(self):
-        _, calls, _, output, _ = self.invoke(
+        _, calls, _, output, _, _ = self.invoke(
             ["--aspect-ratio", "1:1", "--crop-mode", "face"]
         )
         self.assertFalse(calls[0]["render"])
@@ -95,8 +102,8 @@ class MainRenderFlagTests(unittest.TestCase):
         self.assertNotIn("clip:", output)
 
     def test_selection_content_is_identical_with_and_without_render(self):
-        _, _, without_render, _, _ = self.invoke([])
-        _, _, with_render, _, _ = self.invoke(["--render"])
+        _, _, without_render, _, _, _ = self.invoke([])
+        _, _, with_render, _, _, _ = self.invoke(["--render"])
         self.assertEqual(without_render["candidates"], with_render["candidates"])
         self.assertEqual(without_render["highlights"], with_render["highlights"])
 
@@ -126,7 +133,7 @@ class PipelineRenderControlTests(unittest.TestCase):
                 "source.mp4", [HIGHLIGHT], aspect_ratio="9:16"
             )
 
-        self.assertEqual([], selected_only["shorts"])
+        self.assertEqual(selected_only["highlights"], selected_only["shorts"])
         self.assertEqual(rendered, with_render["shorts"])
         self.assertEqual(selected_only["highlights"], with_render["highlights"])
 

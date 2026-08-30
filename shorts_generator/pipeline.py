@@ -40,23 +40,23 @@ def _run_local(
     if not all_highlights:
         raise RuntimeError("Highlight judge found no publishable clips.")
 
-    top = sorted(
+    finalists = sorted(
         all_highlights,
         key=lambda h: float(h.get("final_score", h.get("score", 0))),
         reverse=True,
     )[:num_clips]
-    shorts: List[Dict] = []
+    shorts: List[Dict] = list(finalists)
     if render:
         from .local.clipper import crop_highlights_local
 
         print(
-            f"[pipeline/local] rendering {len(top)} publishable clips "
+            f"[pipeline/local] rendering {len(finalists)} publishable clips "
             f"from {len(candidates)} judged candidates",
             flush=True,
         )
         shorts = crop_highlights_local(
             source_path,
-            top,
+            finalists,
             aspect_ratio=aspect_ratio,
             crop_mode=crop_mode,
         )
@@ -66,7 +66,7 @@ def _run_local(
         "source_video_url": source_path,
         "transcript": transcript,
         "candidates": candidates,
-        "highlights": all_highlights,
+        "highlights": finalists,
         "shorts": shorts,
     }
 
@@ -93,28 +93,28 @@ def _run_api(
     if not all_highlights:
         raise RuntimeError("Highlight judge found no publishable clips.")
 
-    top = sorted(
+    finalists = sorted(
         all_highlights,
         key=lambda h: float(h.get("final_score", h.get("score", 0))),
         reverse=True,
     )[:num_clips]
-    shorts: List[Dict] = []
+    shorts: List[Dict] = list(finalists)
     if render:
         from .clipper import crop_highlights
 
         print(
-            f"[pipeline] rendering {len(top)} publishable clips "
+            f"[pipeline] rendering {len(finalists)} publishable clips "
             f"from {len(candidates)} judged candidates",
             flush=True,
         )
-        shorts = crop_highlights(source_url, top, aspect_ratio=aspect_ratio)
+        shorts = crop_highlights(source_url, finalists, aspect_ratio=aspect_ratio)
 
     return {
         "mode": "api",
         "source_video_url": source_url,
         "transcript": transcript,
         "candidates": candidates,
-        "highlights": all_highlights,
+        "highlights": finalists,
         "shorts": shorts,
     }
 
@@ -150,7 +150,7 @@ def generate_shorts(
           "transcript": {...},
           "candidates": [...],       # all exact-range judgments
           "highlights": [...],       # publishable finalists, deterministically ranked
-          "shorts": [...],           # rendered finalists with clip_url / local path
+          "shorts": [...],           # selected finalists; rendered metadata when enabled
         }
     """
     mode = (mode or "api").lower()
