@@ -641,6 +641,423 @@ def rank_publishable(highlights: List[Dict], num_clips: int) -> List[Dict]:
     return selected
 
 
+FINAL_BOUNDARY_CRITIC_PROMPT = """You are the final semantic-boundary critic for already-selected AI × Business × Money finalists. Check only semantic start/end completeness; never rescore, rerank, or reconsider topic quality. A leading So, And, But, Well, or Now is not by itself a boundary defect: accept it when the proposition is independently understandable. Conversely, detect starts that are grammatically governed by omitted text, such as a previous segment ending in 'is that', 'because', 'which means', or 'the reason is'. Use the supplied preceding segments and candidate_start_options to compare the original opening with possible repaired openings. Explicitly answer whether the original is syntactically dependent, whether it is semantically standalone, whether the proposed repair clearly improves coherence, and whether it introduces unrelated or fragmentary material. Repair a start only when the original is dependent or not standalone, the repair clearly improves it, and it introduces no unrelated/fragmentary material. Never prepend context merely to remove a discourse marker. Expand backward or forward only to supplied real boundaries, prefer the tightest repair, and leave a clean side unchanged. Revalidate the proposed 20–60 second exact range: its opening and ending must be complete, standalone context and payoff must remain present, and repaired_publishable may be true only when all repaired hard gates are true. Return JSON only:
+{"reviews":[{"candidate_id":"candidate_000","start_ok":true,"end_ok":true,"needs_repair":false,"original_opening_syntactically_dependent":false,"original_opening_semantically_standalone":true,"proposed_repair_improves_opening":false,"proposed_repair_introduces_unrelated_or_fragmentary_material":false,"proposed_start_time":0.0,"proposed_end_time":30.0,"repaired_opening_complete":true,"repaired_ending_complete":true,"repaired_standalone_context":true,"repaired_has_payoff":true,"repaired_publishable":true,"reason":"boundary-only explanation"}]}"""
+
+
+PRE_RANKING_BOUNDARY_REPAIR_PROMPT = """You repair exact transcript boundaries for otherwise-strong AI × Business × Money candidates before ranking. Consider only semantic boundary completeness; do not rescore, rerank, or reconsider topic quality. Expand a broken start backward only to the nearest supplied real segment boundary needed for a standalone opening. Expand a broken end forward only through the supplied real segment boundary needed for sentence completion or the obvious payoff. Never alter a boundary already marked complete, invent a timestamp, pad for duration, or continue into a new topic. Revalidate the repaired exact range and return all five hard fields. publishable may be true only when opening_complete, ending_complete, standalone_context, and has_payoff are all true. If no clean local repair exists, keep publishable false. Return JSON only:
+{"repairs":[{"candidate_id":"candidate_000","proposed_start_time":0.0,"proposed_end_time":30.0,"opening_complete":true,"ending_complete":true,"standalone_context":true,"has_payoff":true,"publishable":true,"reason":"boundary-only explanation"}]}"""
+
+
+def _eligible_for_pre_ranking_repair(item):
+    """Allow only strong, boundary-only failures into the repair call."""
+    boundary_failed = not item.get("opening_complete") or not item.get("ending_complete")
+    return bool(
+        boundary_failed
+        and item.get("standalone_context")
+        and item.get("has_payoff")
+        and _ranking_score(item) >= 60.0
+    )
+
+
+
+def _final_boundary_evidence(item, segments):
+    ordered = sorted(segments, key=lambda segment: float(segment["start"]))
+    start = float(item["start_time"])
+    end = float(item["end_time"])
+    indexes = [
+        index
+        for index, segment in enumerate(ordered)
+        if float(segment["start"]) >= start - 1e-6
+        and float(segment["end"]) <= end + 1e-6
+    ]
+    if not indexes:
+        previous_segments = []
+        first_segment = second_segment = last_segment = next_segment = None
+        start_options = []
+    else:
+        first = indexes[0]
+        last = indexes[-1]
+        previous_segments = _format_segments(ordered[max(0, first - 3):first])
+        first_segment = _format_segments([ordered[first]])[0]
+        second_segment = (
+            _format_segments([ordered[first + 1]])[0] if first < last else None
+        )
+        last_segment = _format_segments([ordered[last]])[0]
+        next_segment = (
+            _format_segments([ordered[last + 1]])[0]
+            if last + 1 < len(ordered)
+            else None
+        )
+        start_options = [
+            {
+                "proposed_start_time": float(ordered[index]["start"]),
+                "opening_segments": _format_segments(
+                    ordered[index:min(last + 1, first + 2)]
+                ),
+            }
+            for index in range(max(0, first - 3), first)
+        ]
+
+    return {
+        "candidate_id": item["candidate_id"],
+        "title": item.get("title", ""),
+        "target_niche": TARGET_NICHE,
+        "proposed_start_time": start,
+        "proposed_end_time": end,
+        "previous_segments": previous_segments,
+        "previous_segment": previous_segments[-1] if previous_segments else None,
+        "first_selected_segment": first_segment,
+        "second_selected_segment": second_segment,
+        "last_selected_segment": last_segment,
+        "next_segment": next_segment,
+        "candidate_start_options": start_options,
+    }
+
+
+
+def _match_exact_boundary(value, boundaries):
+    proposed = _coerce_float(value, default=float("nan"))
+    if not math.isfinite(proposed):
+        return None
+    return next(
+        (boundary for boundary in boundaries if abs(boundary - proposed) <= 1e-6),
+        None,
+    )
+
+
+def call_pre_ranking_boundary_repair(candidates, segments, llm_fn):
+    """Make one batched repair/revalidation call for eligible candidates."""
+    evidence = [_candidate_evidence(item, segments) for item in candidates]
+    prompt = (
+        PRE_RANKING_BOUNDARY_REPAIR_PROMPT
+        + "\n\nEligible candidates and bounded transcript evidence:\n"
+        + json.dumps(evidence, ensure_ascii=False)
+    )
+    try:
+        repairs = _parse_json_loose(llm_fn(prompt)).get("repairs")
+    except Exception:
+        return []
+    if not isinstance(repairs, list):
+        return []
+    return [repair for repair in repairs if isinstance(repair, dict)]
+
+
+def _apply_pre_ranking_boundary_repair(item, repair, segments):
+    evidence = _candidate_evidence(item, segments)
+    local_segments = [
+        *evidence["context_before"],
+        *evidence["selected_transcript"],
+        *evidence["context_after"],
+    ]
+    start = _match_exact_boundary(
+        repair.get("proposed_start_time"),
+        [float(segment["start"]) for segment in local_segments],
+    )
+    end = _match_exact_boundary(
+        repair.get("proposed_end_time"),
+        [float(segment["end"]) for segment in local_segments],
+    )
+    if start is None or end is None or end <= start:
+        return None
+
+    original_start = float(item["start_time"])
+    original_end = float(item["end_time"])
+    if item.get("opening_complete"):
+        if abs(start - original_start) > 1e-6:
+            return None
+    elif start >= original_start - 1e-6:
+        return None
+    if item.get("ending_complete"):
+        if abs(end - original_end) > 1e-6:
+            return None
+    elif end <= original_end + 1e-6:
+        return None
+
+    hard_fields = (
+        "opening_complete",
+        "ending_complete",
+        "standalone_context",
+        "has_payoff",
+        "publishable",
+    )
+    if not all(_coerce_bool(repair.get(field)) for field in hard_fields):
+        return None
+
+    selected = [
+        segment
+        for segment in sorted(segments, key=lambda value: float(value["start"]))
+        if float(segment["start"]) >= start - 1e-6
+        and float(segment["end"]) <= end + 1e-6
+    ]
+    if not selected:
+        return None
+    return {
+        **item,
+        "start_time": start,
+        "end_time": end,
+        "actual_opening_quote": str(selected[0].get("text", "")).strip(),
+        "actual_closing_quote": str(selected[-1].get("text", "")).strip(),
+        **{field: True for field in hard_fields},
+        "boundary_repaired": True,
+        "pre_rank_boundary_repaired": True,
+        "final_boundary_repaired": False,
+        "boundary_repair_reason": str(repair.get("reason") or "").strip(),
+    }
+
+
+def repair_boundary_failures_before_ranking(candidates, segments, llm_fn):
+    eligible = [item for item in candidates if _eligible_for_pre_ranking_repair(item)]
+    if not eligible:
+        return candidates
+    repairs = call_pre_ranking_boundary_repair(eligible, segments, llm_fn)
+    by_id = {
+        str(repair.get("candidate_id")): repair
+        for repair in repairs
+        if repair.get("candidate_id") is not None
+    }
+    eligible_ids = {str(item.get("candidate_id")) for item in eligible}
+    results = []
+    for item in candidates:
+        candidate_id = str(item.get("candidate_id"))
+        if candidate_id not in eligible_ids:
+            results.append(item)
+            continue
+        repaired = _apply_pre_ranking_boundary_repair(
+            item, by_id.get(candidate_id, {}), segments
+        )
+        if repaired is None:
+            print(
+                f"[highlights] repair failed {candidate_id}: no clean standalone boundary",
+                flush=True,
+            )
+            results.append(item)
+            continue
+        if repaired["start_time"] != item["start_time"]:
+            print(
+                f"[highlights] repairing {candidate_id} start "
+                f"{float(item['start_time']):.2f} -> {repaired['start_time']:.2f}",
+                flush=True,
+            )
+        if repaired["end_time"] != item["end_time"]:
+            print(
+                f"[highlights] repairing {candidate_id} end "
+                f"{float(item['end_time']):.2f} -> {repaired['end_time']:.2f}",
+                flush=True,
+            )
+        results.append(repaired)
+    return results
+
+
+def call_final_boundary_critic(finalists, segments, llm_fn):
+    evidence = [_final_boundary_evidence(item, segments) for item in finalists]
+    base = FINAL_BOUNDARY_CRITIC_PROMPT + "\n\nFinalists and local transcript evidence:\n" + json.dumps(evidence, ensure_ascii=False)
+    prompt, error = base, "unknown"
+    for attempt in range(MAX_HIGHLIGHT_API_ATTEMPTS):
+        try:
+            reviews = _parse_json_loose(llm_fn(prompt)).get("reviews")
+            if isinstance(reviews, list):
+                return [r for r in reviews if isinstance(r, dict)]
+            error = "missing reviews array"
+        except Exception as exc:
+            error = str(exc)
+        prompt = base + "\n\nIMPORTANT: Return only valid JSON with a reviews array."
+    raise RuntimeError(f"Final boundary critic produced invalid output: {error}")
+
+
+
+def _apply_final_boundary_review(item, review, segments):
+    evidence = _final_boundary_evidence(item, segments)
+    local = [
+        *evidence["previous_segments"],
+        *[
+            evidence[key]
+            for key in (
+                "first_selected_segment",
+                "second_selected_segment",
+                "last_selected_segment",
+                "next_segment",
+            )
+            if evidence[key]
+        ],
+    ]
+    reported_start_ok = _coerce_bool(review.get("start_ok"))
+    end_ok = _coerce_bool(review.get("end_ok"))
+    semantic_fields_present = all(
+        field in review
+        for field in (
+            "original_opening_syntactically_dependent",
+            "original_opening_semantically_standalone",
+            "proposed_repair_improves_opening",
+            "proposed_repair_introduces_unrelated_or_fragmentary_material",
+        )
+    )
+    opening_dependent = _coerce_bool(
+        review.get("original_opening_syntactically_dependent")
+    )
+    opening_standalone = _coerce_bool(
+        review.get("original_opening_semantically_standalone")
+    )
+    start_ok = (
+        not opening_dependent and opening_standalone
+        if semantic_fields_present
+        else reported_start_ok
+    )
+    reason = str(review.get("reason") or "").strip()
+    original_start = float(item["start_time"])
+    original_end = float(item["end_time"])
+    previously_repaired = bool(item.get("boundary_repaired"))
+    pre_rank_repaired = bool(
+        item.get("pre_rank_boundary_repaired", previously_repaired)
+    )
+
+    if start_ok and end_ok:
+        return {
+            **item,
+            "boundary_repaired": previously_repaired,
+            "pre_rank_boundary_repaired": pre_rank_repaired,
+            "final_boundary_repaired": bool(item.get("final_boundary_repaired")),
+            "boundary_critic_reason": reason,
+        }
+
+    start = _match_exact_boundary(
+        review.get("proposed_start_time"),
+        [float(segment["start"]) for segment in local],
+    )
+    end = _match_exact_boundary(
+        review.get("proposed_end_time"),
+        [float(segment["end"]) for segment in local],
+    )
+    if start is None or end is None or end <= start:
+        return None
+    if not MIN_HIGHLIGHT_SECONDS <= end - start <= MAX_HIGHLIGHT_SECONDS:
+        return None
+
+    # Clean sides are immutable; broken sides may only expand outward.
+    if start_ok:
+        if abs(start - original_start) > 1e-6:
+            return None
+    else:
+        repair_improves = _coerce_bool(
+            review.get("proposed_repair_improves_opening")
+        )
+        repair_adds_fragment = _coerce_bool(
+            review.get("proposed_repair_introduces_unrelated_or_fragmentary_material")
+        )
+        if start >= original_start - 1e-6 or not repair_improves or repair_adds_fragment:
+            return None
+    if end_ok:
+        if abs(end - original_end) > 1e-6:
+            return None
+    elif end <= original_end + 1e-6:
+        return None
+
+    repaired_hard_fields = (
+        "repaired_opening_complete",
+        "repaired_ending_complete",
+        "repaired_standalone_context",
+        "repaired_has_payoff",
+        "repaired_publishable",
+    )
+    if not all(_coerce_bool(review.get(field)) for field in repaired_hard_fields):
+        return None
+
+    selected = [
+        segment
+        for segment in sorted(segments, key=lambda value: float(value["start"]))
+        if float(segment["start"]) >= start - 1e-6
+        and float(segment["end"]) <= end + 1e-6
+    ]
+    if not selected:
+        return None
+    actual_opening_quote = str(selected[0].get("text", "")).strip()
+
+    return {
+        **item,
+        "start_time": start,
+        "end_time": end,
+        "actual_opening_quote": actual_opening_quote,
+        "actual_closing_quote": str(selected[-1].get("text", "")).strip(),
+        "boundary_repaired": True,
+        "pre_rank_boundary_repaired": pre_rank_repaired,
+        "final_boundary_repaired": True,
+        "boundary_critic_reason": reason,
+    }
+
+
+def verify_final_boundaries(finalists, segments, llm_fn):
+    if not finalists:
+        return []
+    reviews = call_final_boundary_critic(finalists, segments, llm_fn)
+    by_id = {str(r.get("candidate_id")): r for r in reviews if r.get("candidate_id") is not None}
+    results = []
+    for item in finalists:
+        candidate_id = str(item.get("candidate_id"))
+        review = by_id.get(candidate_id)
+        verified = _apply_final_boundary_review(item, review, segments) if review else None
+        repair_requested = bool(
+            review
+            and (
+                not _coerce_bool(review.get("start_ok"))
+                or not _coerce_bool(review.get("end_ok"))
+            )
+        )
+        if verified is None:
+            if repair_requested or review is None:
+                reason = (
+                    str(review.get("reason") or "").strip()
+                    if review
+                    else "missing critic review"
+                )
+                print(
+                    f"[highlights] final boundary repair failed {candidate_id}: "
+                    f"{reason or 'invalid or incomplete local repair'}",
+                    flush=True,
+                )
+            continue
+        if verified.get("final_boundary_repaired"):
+            if verified["start_time"] != item["start_time"]:
+                print(
+                    f"[highlights] final boundary repair {candidate_id} start "
+                    f"{float(item['start_time']):.2f} -> {verified['start_time']:.2f}",
+                    flush=True,
+                )
+            if verified["end_time"] != item["end_time"]:
+                print(
+                    f"[highlights] final boundary repair {candidate_id} end "
+                    f"{float(item['end_time']):.2f} -> {verified['end_time']:.2f}",
+                    flush=True,
+                )
+        results.append(verified)
+    return results
+
+
+
+
+def select_finalists_with_boundary_qa(
+    judged_candidates,
+    segments,
+    num_clips,
+    llm_fn,
+):
+    """Run final QA on a bounded ranked pool and backfill from survivors."""
+    if num_clips <= 0:
+        return []
+    publishable_count = sum(
+        1 for candidate in judged_candidates if candidate.get("publishable")
+    )
+    finalist_pool_size = min(
+        publishable_count,
+        max(num_clips + 2, num_clips * 2),
+    )
+    finalist_pool = rank_publishable(
+        judged_candidates,
+        num_clips=finalist_pool_size,
+    )
+    survivors = verify_final_boundaries(finalist_pool, segments, llm_fn)
+    return survivors[:num_clips]
+
+
 def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
@@ -696,7 +1113,12 @@ def get_highlights(
         return {"highlights": [], "candidates": []}
 
     judged_candidates = judge_candidates(candidates, segments, llm_fn)
-    highlights = rank_publishable(judged_candidates, num_clips=num_clips)
+    judged_candidates = repair_boundary_failures_before_ranking(
+        judged_candidates, segments, llm_fn
+    )
+    highlights = select_finalists_with_boundary_qa(
+        judged_candidates, segments, num_clips, llm_fn
+    )
     return {
         "highlights": highlights,
         "candidates": judged_candidates,
