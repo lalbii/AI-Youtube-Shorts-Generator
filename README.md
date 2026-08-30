@@ -119,7 +119,7 @@ python main.py "https://www.youtube.com/watch?v=VIDEO_ID"
 python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local
 ```
 
-Local mode writes the rendered shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`).
+By default, the CLI selects clips and writes `clip_final.json` without rendering. Pass `--render` to also write local-mode shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`).
 
 ### With options
 
@@ -150,6 +150,7 @@ result = generate_shorts(
     num_clips=5,
     aspect_ratio="9:16",
     mode="local",
+    render=True,
 )
 for short in result["shorts"]:
     print(short["score"], short["title"], short["clip_url"])
@@ -176,11 +177,12 @@ xargs -a urls.txt -I{} python main.py "{}"
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--mode` | `api` | `api` (MuAPI, fast, no setup) or `local` (remote URL, `file://`, or local path + faster-whisper + LLM provider + ffmpeg) |
-| `--num-clips` | `3` | How many shorts to render |
+| `--num-clips` | `3` | How many clips to select |
 | `--aspect-ratio` | `9:16` | Any ratio; `9:16` for TikTok/Reels, `1:1` for square |
 | `--format` | `720` | Source download resolution: `360` / `480` / `720` / `1080` |
 | `--language` | auto | Force Whisper language code (e.g. `en`) |
-| `--output-json` | — | Dump the full result (transcript + all candidates) to a file |
+| `--output-json` | `clip_final.json` | Write the full selection result (transcript + all candidates) |
+| `--render` | off | Render selected clips after selection; disabled by default |
 
 ### API mode vs Local mode
 
@@ -199,12 +201,81 @@ xargs -a urls.txt -I{} python main.py "{}"
 2. **Transcribe**: MuAPI `/openai-whisper` produces a timestamped transcript (verbose_json segments)
 3. **Detect content type**: An LLM classifies the video (podcast, interview, tutorial, vlog, etc.) and density, so the prompt can be tuned per content style
 4. **Long-video chunking**: Videos > 30 min are split into 20-min overlapping chunks
-5. **Highlight ranking**: An LLM scans the transcript through a virality framework — hook moments, emotional peaks, opinion bombs, revelations, conflict, quotables, story peaks, practical value — and emits ranked candidates with scores 0–100
-6. **Dedupe**: Overlapping candidates are collapsed by score (>50% overlap → keep the higher score)
-7. **Top-N selection**: The top `--num-clips` candidates are selected
-8. **Auto-crop**: Each highlight is rendered as a vertical short at the requested aspect ratio
+5. **Candidate discovery**: An LLM scans the transcript for roughly 10–15 promising ranges when three clips are requested; its provisional score is diagnostic only
+6. **Exact-range judge**: A separate LLM pass receives each selected transcript plus immediate before/after context, may propose segment-aligned boundary repairs, applies hard publishability gates, and returns component scores
+7. **Deterministic ranking**: Python computes the final score, suppresses substantial timestamp overlap, applies lightweight topic diversity, and may return fewer than requested when too few clips are publishable
+8. **Optional auto-crop**: With `--render`, each publishable finalist is rendered at the requested aspect ratio
 
-**Output**: a list of mp4 URLs plus, for each clip, its title, viral score, hook sentence, and a one-line reason explaining why it should perform.
+**Output**: judged candidates, publishable finalists, and rendered mp4 URLs. Each judgment distinguishes verbatim opening/closing transcript quotes from optional generated display-hook copy.
+
+## Viral Highlight Selection
+
+The current V1.5 selector remains transcript-only. Content classification and long-video chunking are retained, but discovery and evaluation are separate. Discovery produces a high-recall pool and cannot decide the final ranking. One batch judge pass evaluates exact ranges against nearby context for complete openings, endings, standalone context, and payoff; only candidates passing every hard gate can become finalists. Python derives verbatim `actual_opening_quote` and `actual_closing_quote` values from transcript segments, computes the weighted `final_score`, performs overlap suppression, and prefers distinct judge-provided topic labels.
+
+Generated `display_hook` text is presentation metadata only. `hook_sentence` remains as its compatibility alias, but neither field is supplied as scoring evidence. The selector may return fewer than `--num-clips`. Its remaining limitations include reliance on LLM semantic judgments, lightweight string-label diversity rather than embeddings, transcript-segment boundary granularity, and no delivery, audio-emotion, speaker, or visual signals.
+
+### Future Work: Selector V2
+
+> The following architecture is planned work, not currently implemented functionality.
+
+1. **High-recall candidate generation:** collect roughly 10–20 plausible moments across the full source, retaining timestamps, excerpt, proposed hook, and discovery rationale. Candidate count should reflect source length rather than final clip count.
+2. **Independent multi-dimensional judge:** score candidates separately from discovery on hook strength, standalone clarity, novelty, emotional intensity, practical value, controversy/tension, payoff, quotability, niche relevance, and shareability. A starting niche score is `18% hook + 15% clarity + 12% novelty + 12% payoff + 12% niche relevance + 8% practical value + 8% emotion/tension + 7% quotability + 8% shareability`. Component scores should be retained for inspection and later calibration.
+3. **Niche-aware scoring:** make niche relevance a configurable ranking signal rather than a hard filter. An `ai_business_money` profile would favor concrete money/revenue/cost claims, AI-driven job or workflow change, founder mistakes, contrarian business or investing views, automation, career disruption, unusual startup stories, and strong technology predictions. Other profiles should be data/configuration, not selector code.
+4. **Semantic diversity:** after judging, penalize candidates that are temporally close, express the same claim, or cover the same subtopic. Lightweight embeddings are preferred; an LLM pairwise similarity check is a fallback for the small finalist set. Diversity should be a soft penalty so an exceptional section can still contribute more than one clip.
+5. **Boundary refinement:** identify the core claim first, then inspect nearby transcript context and independently choose sentence-aligned boundaries that preserve hook → build/context → payoff within 20–60 seconds. The existing transcript-aware normalizer remains the final safety layer.
+6. **Lightweight multimodal features:** add cheap signals before heavy video models. Recommended order is audio RMS/energy and pause changes (high benefit, low complexity/CPU), speech-rate change and speaker-turn density (medium-high benefit, low-medium cost), laughter cues (medium benefit/cost), title/topic metadata (medium benefit, very low cost), and sparse sampled-frame scene/reaction changes (medium benefit, medium CPU).
+7. **Performance-feedback loop:** log candidate components, topic, duration, platform, and outcomes. With fewer than 100 published clips, inspect errors and tune transparent weights; at 100–500, use shrinkage-aware regressions or pairwise ranking; beyond roughly 500, evaluate learning-to-rank and embeddings against similar successful clips. Raw views are noisy because distribution, account size, posting time, packaging, platform, and randomness confound selector quality; retention, shares, saves, comments, and within-account/platform comparisons are stronger labels.
+
+#### Future Work: Performance-Conditioned Ranking
+
+> This is planned future work, not currently implemented.
+
+The initial component weights are hand-designed. For every published clip, a future system should retain selector features—`hook_strength`, `standalone_clarity`, `novelty`, `payoff`, `niche_relevance`, `practical_value`, `emotional_intensity`, `quotability`, `shareability`, `duration`, `topic`, `source`, and `speaker`—alongside outcomes such as `views_24h`, `views_7d`, `average_watch_time`, `completion_rate`, `shares`, `saves`, `comments`, `follows_generated`, `platform`, and `posting_time`.
+
+Raw views should not be the target by themselves: account size, platform distribution, posting time, source popularity, trends, audience geography, and other confounders can dominate clip quality. A normalized performance objective should emphasize retention/average watch time, completion rate, shares, saves, follows generated, and views normalized within comparable account, platform, and time contexts.
+
+| Published clips | Planned approach |
+|---|---|
+| **<50** | Keep manual weights, collect clean metadata and outcomes, and do not train a model. |
+| **50–150** | Analyze relationships between component scores and performance, then adjust transparent weights based on evidence. |
+| **150–500** | Introduce a lightweight ranker such as logistic regression, linear/pairwise ranking, or gradient boosting. Include duration, topic, source, and posting-time context; avoid deep learning. |
+| **500+** | Evaluate account-specific weights, pairwise preference models, embeddings, similarity to historically successful clips, and nearest-neighbor performance signals. |
+
+Pairwise ranking asks which of two candidates from comparable contexts is more likely to outperform the other, rather than attempting to predict an exact and highly noisy view count.
+
+```text
+Long Video
+    ↓
+High-Recall Candidate Generator
+    ↓
+LLM Component Scoring
+    ↓
+Account-Specific Learned Ranker
+    ↓
+Semantic Diversity Filter
+    ↓
+Boundary Refinement
+    ↓
+Top Clips
+    ↓
+Publish
+    ↓
+Observed Performance
+    ↓
+Training / Calibration Data
+    ↺
+(calibrates scoring and ranking)
+```
+
+The long-term question is not “Is this clip generically viral?” but “How likely is this clip to perform well for this specific account and audience?” A configurable profile such as the following would allow the same source video to produce different finalists for different audiences:
+
+```yaml
+selection:
+  niche: ai_business_money
+  ranking_profile: account_specific
+```
+
+Before enough production data exists, evaluate on 3–5 diverse podcasts using blinded top-k versus random or prior-selector clips. Reviewers should score hook strength, standalone clarity, payoff, niche relevance, publishability, and semantic diversity, with pairwise preference used where absolute scores disagree. Track publishable precision@3 and source-level topic coverage. A practical V1 baseline is at least 2 of 3 clips publishable per source. V2 should reach at least 80% publishable precision@3, beat random/baseline clips in at least 70% of blinded pairwise comparisons, and avoid semantic duplicates in at least 90% of final three-clip sets.
 
 ## Output
 
@@ -229,15 +300,21 @@ Highlights:    7 candidates → kept top 3
 {
   "source_video_url": "...",
   "transcript": { "duration": 1873.4, "segments": [...] },
-  "highlights": [ {...}, {...}, ... ],
+  "candidates": [ {...all exact-range judgments...} ],
+  "highlights": [ {...publishable finalists...} ],
   "shorts": [
     {
       "title": "...",
       "start_time": 124.3,
       "end_time": 187.6,
-      "score": 92,
-      "hook_sentence": "...",
-      "virality_reason": "...",
+      "actual_opening_quote": "verbatim first spoken segment",
+      "actual_closing_quote": "verbatim final spoken segment",
+      "display_hook": "optional generated overlay",
+      "hook_sentence": "optional generated overlay (compatibility alias)",
+      "scores": { "actual_hook_strength": 9, "standalone_clarity": 8 },
+      "final_score": 86.4,
+      "score": 86.4,
+      "judge_reason": "...",
       "clip_url": "https://.../short_1.mp4"
     }
   ]

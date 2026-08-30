@@ -6,3 +6,7 @@ venv/
 output/
 *.mp4
 .DS_Store
+
+# Local selector outputs
+clip_v15*.json
+clip_*final*.json
