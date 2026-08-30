@@ -119,7 +119,7 @@ python main.py "https://www.youtube.com/watch?v=VIDEO_ID"
 python main.py "https://www.youtube.com/watch?v=VIDEO_ID" --mode local
 ```
 
-Local mode writes the rendered shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`).
+By default, the CLI selects clips and writes `clip_final.json` without rendering. Pass `--render` to also write local-mode shorts to `./output/short_01.mp4`, `short_02.mp4`, … (override with `LOCAL_OUTPUT_DIR`).
 
 ### With options
 
@@ -150,6 +150,7 @@ result = generate_shorts(
     num_clips=5,
     aspect_ratio="9:16",
     mode="local",
+    render=True,
 )
 for short in result["shorts"]:
     print(short["score"], short["title"], short["clip_url"])
@@ -176,11 +177,12 @@ xargs -a urls.txt -I{} python main.py "{}"
 | Flag | Default | Notes |
 |------|---------|-------|
 | `--mode` | `api` | `api` (MuAPI, fast, no setup) or `local` (remote URL, `file://`, or local path + faster-whisper + LLM provider + ffmpeg) |
-| `--num-clips` | `3` | How many shorts to render |
+| `--num-clips` | `3` | How many clips to select |
 | `--aspect-ratio` | `9:16` | Any ratio; `9:16` for TikTok/Reels, `1:1` for square |
 | `--format` | `720` | Source download resolution: `360` / `480` / `720` / `1080` |
 | `--language` | auto | Force Whisper language code (e.g. `en`) |
-| `--output-json` | — | Dump the full result (transcript + all candidates) to a file |
+| `--output-json` | `clip_final.json` | Write the full selection result (transcript + all candidates) |
+| `--render` | off | Render selected clips after selection; disabled by default |
 
 ### API mode vs Local mode
 
@@ -202,7 +204,7 @@ xargs -a urls.txt -I{} python main.py "{}"
 5. **Candidate discovery**: An LLM scans the transcript for roughly 10–15 promising ranges when three clips are requested; its provisional score is diagnostic only
 6. **Exact-range judge**: A separate LLM pass receives each selected transcript plus immediate before/after context, may propose segment-aligned boundary repairs, applies hard publishability gates, and returns component scores
 7. **Deterministic ranking**: Python computes the final score, suppresses substantial timestamp overlap, applies lightweight topic diversity, and may return fewer than requested when too few clips are publishable
-8. **Auto-crop**: Each publishable finalist is rendered at the requested aspect ratio
+8. **Optional auto-crop**: With `--render`, each publishable finalist is rendered at the requested aspect ratio
 
 **Output**: judged candidates, publishable finalists, and rendered mp4 URLs. Each judgment distinguishes verbatim opening/closing transcript quotes from optional generated display-hook copy.
 

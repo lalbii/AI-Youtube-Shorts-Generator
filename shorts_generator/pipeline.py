@@ -8,7 +8,6 @@ Two modes:
 """
 from typing import Dict, List, Optional
 
-from .clipper import crop_highlights
 from .downloader import download_youtube
 from .highlights import call_muapi_llm, get_highlights
 from .transcriber import transcribe
@@ -21,8 +20,8 @@ def _run_local(
     download_format: str,
     language: Optional[str],
     crop_mode: str,
+    render: bool,
 ) -> Dict:
-    from .local.clipper import crop_highlights_local
     from .local.downloader import download_youtube_local
     from .local.llm import call_local_llm
     from .local.transcriber import transcribe_local
@@ -46,18 +45,21 @@ def _run_local(
         key=lambda h: float(h.get("final_score", h.get("score", 0))),
         reverse=True,
     )[:num_clips]
-    print(
-        f"[pipeline/local] rendering {len(top)} publishable clips "
-        f"from {len(candidates)} judged candidates",
-        flush=True,
-    )
+    shorts: List[Dict] = []
+    if render:
+        from .local.clipper import crop_highlights_local
 
-    shorts = crop_highlights_local(
-        source_path,
-        top,
-        aspect_ratio=aspect_ratio,
-        crop_mode=crop_mode,
-    )
+        print(
+            f"[pipeline/local] rendering {len(top)} publishable clips "
+            f"from {len(candidates)} judged candidates",
+            flush=True,
+        )
+        shorts = crop_highlights_local(
+            source_path,
+            top,
+            aspect_ratio=aspect_ratio,
+            crop_mode=crop_mode,
+        )
 
     return {
         "mode": "local",
@@ -75,6 +77,7 @@ def _run_api(
     aspect_ratio: str,
     download_format: str,
     language: Optional[str],
+    render: bool,
 ) -> Dict:
     source_url = download_youtube(youtube_url, fmt=download_format)
 
@@ -95,13 +98,16 @@ def _run_api(
         key=lambda h: float(h.get("final_score", h.get("score", 0))),
         reverse=True,
     )[:num_clips]
-    print(
-        f"[pipeline] rendering {len(top)} publishable clips "
-        f"from {len(candidates)} judged candidates",
-        flush=True,
-    )
+    shorts: List[Dict] = []
+    if render:
+        from .clipper import crop_highlights
 
-    shorts = crop_highlights(source_url, top, aspect_ratio=aspect_ratio)
+        print(
+            f"[pipeline] rendering {len(top)} publishable clips "
+            f"from {len(candidates)} judged candidates",
+            flush=True,
+        )
+        shorts = crop_highlights(source_url, top, aspect_ratio=aspect_ratio)
 
     return {
         "mode": "api",
@@ -121,12 +127,13 @@ def generate_shorts(
     language: Optional[str] = None,
     mode: str = "api",
     crop_mode: str = "face",
+    render: bool = False,
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
     Args:
         youtube_url: source URL.
-        num_clips: how many shorts to render.
+        num_clips: how many clips to select.
         aspect_ratio: e.g. "9:16", "1:1".
         download_format: source resolution ("360" / "480" / "720" / "1080").
         language: ISO-639-1 to force Whisper language detection.
@@ -134,6 +141,7 @@ def generate_shorts(
             OpenAI or Gemini + ffmpeg).
         crop_mode: local renderer layout: "center", "static-face", "face", or
             "fit-blur". Ignored in API mode.
+        render: render selected clips after selection. Disabled by default.
 
     Returns:
         {
@@ -154,7 +162,8 @@ def generate_shorts(
             download_format,
             language,
             crop_mode,
+            render,
         )
     if mode == "api":
-        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language)
+        return _run_api(youtube_url, num_clips, aspect_ratio, download_format, language, render)
     raise ValueError(f"Unknown mode: {mode!r}. Use 'api' or 'local'.")
