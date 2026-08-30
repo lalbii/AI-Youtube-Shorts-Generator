@@ -641,6 +641,72 @@ def rank_publishable(highlights: List[Dict], num_clips: int) -> List[Dict]:
     return selected
 
 
+FINAL_BOUNDARY_CRITIC_PROMPT = """You are the final semantic-boundary critic for already-selected AI × Business × Money finalists. Check only whether the start is a clean standalone opening and the end is semantically complete. Never rescore, rerank, or reconsider content quality. Repair only with timestamps present in the supplied local evidence. Expand backward only for a mid-sentence, mid-thought, or context-dependent start; expand forward only for an obvious completion/payoff. Prefer the tightest complete clip and add no unnecessary context or new topic. Preserve strong standalone hooks even when earlier context exists. If clean, keep timestamps and set needs_repair false. If broken and not locally repairable, set needs_repair true; it will be rejected. Return JSON only:
+{"reviews":[{"candidate_id":"candidate_000","start_ok":true,"end_ok":true,"needs_repair":false,"proposed_start_time":0.0,"proposed_end_time":30.0,"reason":"boundary-only explanation"}]}"""
+
+
+def _final_boundary_evidence(item, segments):
+    ordered = sorted(segments, key=lambda s: float(s["start"]))
+    start, end = float(item["start_time"]), float(item["end_time"])
+    indexes = [i for i, s in enumerate(ordered) if float(s["start"]) >= start - 1e-6 and float(s["end"]) <= end + 1e-6]
+    def at(i):
+        return _format_segments([ordered[i]])[0] if 0 <= i < len(ordered) else None
+    if indexes:
+        first, last = indexes[0], indexes[-1]
+        local = (at(first - 1), at(first), at(first + 1) if first < last else None, at(last), at(last + 1))
+    else:
+        local = (None,) * 5
+    return dict(zip(("previous_segment", "first_selected_segment", "second_selected_segment", "last_selected_segment", "next_segment"), local), candidate_id=item["candidate_id"], title=item.get("title", ""), target_niche=TARGET_NICHE, proposed_start_time=start, proposed_end_time=end)
+
+
+def call_final_boundary_critic(finalists, segments, llm_fn):
+    evidence = [_final_boundary_evidence(item, segments) for item in finalists]
+    base = FINAL_BOUNDARY_CRITIC_PROMPT + "\n\nFinalists and local transcript evidence:\n" + json.dumps(evidence, ensure_ascii=False)
+    prompt, error = base, "unknown"
+    for attempt in range(MAX_HIGHLIGHT_API_ATTEMPTS):
+        try:
+            reviews = _parse_json_loose(llm_fn(prompt)).get("reviews")
+            if isinstance(reviews, list):
+                return [r for r in reviews if isinstance(r, dict)]
+            error = "missing reviews array"
+        except Exception as exc:
+            error = str(exc)
+        prompt = base + "\n\nIMPORTANT: Return only valid JSON with a reviews array."
+    raise RuntimeError(f"Final boundary critic produced invalid output: {error}")
+
+
+def _apply_final_boundary_review(item, review, segments):
+    evidence = _final_boundary_evidence(item, segments)
+    local = [evidence[k] for k in ("previous_segment", "first_selected_segment", "second_selected_segment", "last_selected_segment", "next_segment") if evidence[k]]
+    repair, reason = _coerce_bool(review.get("needs_repair")), str(review.get("reason") or "").strip()
+    if _coerce_bool(review.get("start_ok")) and _coerce_bool(review.get("end_ok")) and not repair:
+        return {**item, "boundary_repaired": False, "boundary_critic_reason": reason}
+    if not repair:
+        return None
+    start = _match_boundary(review.get("proposed_start_time"), [float(s["start"]) for s in local])
+    end = _match_boundary(review.get("proposed_end_time"), [float(s["end"]) for s in local])
+    if start is None or end is None or end <= start:
+        return None
+    selected = [s for s in sorted(segments, key=lambda x: float(x["start"])) if float(s["start"]) >= start - 1e-6 and float(s["end"]) <= end + 1e-6]
+    if not selected:
+        return None
+    return {**item, "start_time": start, "end_time": end, "actual_opening_quote": str(selected[0].get("text", "")).strip(), "actual_closing_quote": str(selected[-1].get("text", "")).strip(), "boundary_repaired": start != float(item["start_time"]) or end != float(item["end_time"]), "boundary_critic_reason": reason}
+
+
+def verify_final_boundaries(finalists, segments, llm_fn):
+    if not finalists:
+        return []
+    reviews = call_final_boundary_critic(finalists, segments, llm_fn)
+    by_id = {str(r.get("candidate_id")): r for r in reviews if r.get("candidate_id") is not None}
+    results = []
+    for item in finalists:
+        review = by_id.get(str(item.get("candidate_id")))
+        verified = _apply_final_boundary_review(item, review, segments) if review else None
+        if verified is not None:
+            results.append(verified)
+    return results
+
+
 def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
@@ -696,7 +762,8 @@ def get_highlights(
         return {"highlights": [], "candidates": []}
 
     judged_candidates = judge_candidates(candidates, segments, llm_fn)
-    highlights = rank_publishable(judged_candidates, num_clips=num_clips)
+    finalists = rank_publishable(judged_candidates, num_clips=num_clips)
+    highlights = verify_final_boundaries(finalists, segments, llm_fn)
     return {
         "highlights": highlights,
         "candidates": judged_candidates,

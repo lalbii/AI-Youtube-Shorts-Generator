@@ -6,7 +6,7 @@ from ..config import (
     require_gemini_key,
     require_openai_key,
 )
-
+import os
 
 def call_openai_llm(prompt: str) -> str:
     """OpenAI Chat Completions backend used by --mode local."""
@@ -19,13 +19,21 @@ def call_openai_llm(prompt: str) -> str:
         ) from e
 
     client = OpenAI(api_key=require_openai_key())
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0.7,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.choices[0].message.content or ""
 
+    kwargs = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    if OPENAI_MODEL.startswith("gpt-5.6"):
+        kwargs["reasoning_effort"] = os.getenv(
+            "OPENAI_REASONING_EFFORT", "medium"
+        )
+    else:
+        kwargs["temperature"] = 0.7
+
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content or ""
 
 def call_gemini_llm(prompt: str) -> str:
     """Gemini backend used by --mode local when LLM_PROVIDER=gemini."""
