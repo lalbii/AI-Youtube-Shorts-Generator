@@ -28,7 +28,7 @@ class SelectionError(ValueError):
 
 
 Renderer = Callable[..., list[dict[str, Any]]]
-CROP_MODES = ("center", "static-face", "face", "fit-blur")
+CROP_MODES = ("center", "static-face", "face", "fit-blur", "smart-layout")
 
 
 def _timestamp(value: Any, field: str, index: int) -> float:
@@ -199,7 +199,8 @@ def _parser() -> argparse.ArgumentParser:
         default="static-face",
         help=(
             "Layout: fixed center, fixed median face, dynamic face, or full-frame "
-            "fit over blur (default: static-face)"
+            "fit over blur; smart-layout uses stable scene-aware single/split/fallback "
+            "blocks (default: static-face)"
         ),
     )
     return parser

@@ -99,6 +99,18 @@ class RenderSelectedTests(unittest.TestCase):
 
         self.assertEqual(arguments.crop_mode, "fit-blur")
 
+    def test_cli_accepts_smart_layout_crop_mode(self) -> None:
+        arguments = _parser().parse_args(
+            [
+                "--source", "source.mp4",
+                "--selection-json", "selection.json",
+                "--output-dir", "output",
+                "--crop-mode", "smart-layout",
+            ]
+        )
+
+        self.assertEqual(arguments.crop_mode, "smart-layout")
+
     def test_rerender_imports_only_local_clipper_and_keeps_order(self) -> None:
         source = self.root / "source.mp4"
         source.touch()
