@@ -3,14 +3,16 @@
 Logic ported from ViralVadoo's transcript_analysis/highlight_generator.py:
   - content-type / density detection
   - chunking for long videos with overlap
-  - virality-criteria prompt
-  - score-based dedupe with overlap suppression
+  - high-recall candidate discovery
+  - exact-range publishability judging
+  - deterministic component scoring and overlap suppression
 
 The LLM call is pluggable via the `llm_fn` argument so the same prompts can
 drive either MuAPI (default, --mode api) or a direct local LLM client
 (--mode local).
 """
 import json
+import math
 import re
 from typing import Callable, Dict, List, Optional
 
@@ -39,38 +41,71 @@ Virality signals to prioritize (ranked by impact):
 """
 
 
-HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
+HIGHLIGHT_SYSTEM_PROMPT = """You are a high-recall short-form video candidate scout.
 
 {virality_criteria}
 
 Content type: {content_type} | Density: {density}
 
-Your task: identify the most viral-worthy highlights from the transcript.
+Your task: discover promising candidate passages for a separate editor to judge later.
 
 Rules:
-- Every highlight must open with a strong HOOK — a line that grabs attention within the first 3 seconds
-- Each start_time and end_time must use the bracketed transcript timestamps for one continuous passage
+- Return approximately {candidate_count} candidates when the transcript supports them
+- Favor recall and variety: include concrete numbers, strong claims, useful explanations, business stories, predictions, tension, and payoffs
+- Each start_time and end_time must exactly match bracketed transcript segment boundaries for one continuous passage
 - Duration must be 20-60 seconds; strongly prefer 25-45 seconds
-- Include a complete HOOK → context/build → payoff arc; do not return only the hook sentence
-- Never cut mid-sentence or mid-thought — each clip must feel complete and self-contained
-- Clips must not overlap significantly with each other
-- Score 0-100 on viral potential (not general quality)
-- {num_clips_instruction}
-- For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
-- Explain in one sentence why this clip is viral ("virality_reason")
+- Prefer complete passages, but do not hide uncertainty by inventing spoken lines
+- display_hook is optional generated overlay copy and does not need to be verbatim
+- provisional_score is for discovery diagnostics only and will never determine finalists
+- Do not judge or provide a final overall score
 
 Respond ONLY with valid JSON (no markdown, no explanation):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"provisional_score":int,"display_hook":"string","discovery_reason":"string"}}]}}"""
+
+
+TARGET_NICHE = "AI × Business × Money"
+
+
+JUDGE_SYSTEM_PROMPT = """You are the publishability judge for short-form clips in the niche AI × Business × Money.
+
+Judge each EXACT timestamp range from its actual spoken transcript, not from its title, display_hook, discovery reason, or provisional score. A generated display_hook must never influence any score.
+
+Relevant themes include AI changing work or business, automation, founders, startup mistakes, revenue/profit/cost figures, investing and business decisions, contrarian opinions, unusual business stories, business opportunities, concrete predictions, and practical insights.
+
+For each candidate:
+- Inspect the selected transcript plus the immediate before/after context.
+- opening_complete must be false for a mid-sentence/mid-thought opening, a dangling conjunction, or an unexplained reference.
+- ending_complete must be false when the thought or answer continues, the payoff is just after the end, or the clip ends during setup.
+- standalone_context must be false if a cold viewer cannot understand the passage.
+- has_payoff requires a real explanation, conclusion, surprising fact, practical insight, punchline, or completed claim.
+- publishable may be true only when all four checks are true.
+- You may repair boundaries using corrected_start_time and corrected_end_time, but both must exactly match supplied transcript segment boundaries, remain one continuous passage, and normally last 20-60 seconds. Expand only for necessary setup/payoff, never as blind padding.
+- actual_hook_strength scores only the first ACTUALLY SPOKEN content in the corrected range. Never score display_hook.
+- Return all eight component scores from 0 to 10. Do not return or calculate an overall score.
+- topic_key should be a short semantic label used for lightweight diversity.
+
+Respond ONLY with valid JSON:
+{"judgments":[{"candidate_id":"candidate_000","corrected_start_time":0.0,"corrected_end_time":30.0,"opening_complete":true,"ending_complete":true,"standalone_context":true,"has_payoff":true,"publishable":true,"scores":{"actual_hook_strength":0,"standalone_clarity":0,"payoff_strength":0,"niche_relevance":0,"novelty":0,"practical_value":0,"emotional_tension":0,"quotability_shareability":0},"display_hook":"optional overlay copy","topic_key":"short semantic label","judge_reason":"concise exact-range explanation"}]}"""
 
 
 CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
 LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
 MIN_HIGHLIGHT_SECONDS = 20
-TARGET_HIGHLIGHT_SECONDS = 40
 MAX_HIGHLIGHT_SECONDS = 60
 GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call should fail fast
 MAX_HIGHLIGHT_API_ATTEMPTS = 3
+
+SCORE_WEIGHTS = {
+    "actual_hook_strength": 0.20,
+    "standalone_clarity": 0.18,
+    "payoff_strength": 0.16,
+    "niche_relevance": 0.15,
+    "novelty": 0.10,
+    "practical_value": 0.08,
+    "emotional_tension": 0.05,
+    "quotability_shareability": 0.08,
+}
 
 
 def call_muapi_llm(prompt: str) -> str:
@@ -134,7 +169,7 @@ def _fit_to_transcript(
     end: float,
     segments: List[Dict],
 ) -> Optional[tuple]:
-    """Fit a model range to a complete 20-60s transcript passage."""
+    """Align a proposed range to nearby segment boundaries without padding it."""
     ordered = sorted(segments, key=lambda s: float(s["start"]))
     anchor = next(
         (
@@ -148,24 +183,12 @@ def _fit_to_transcript(
         return None
 
     aligned_start = float(anchor["start"])
-    valid_ends = [
-        float(s["end"])
-        for s in ordered
-        if MIN_HIGHLIGHT_SECONDS <= float(s["end"]) - aligned_start <= MAX_HIGHLIGHT_SECONDS
-    ]
-    if not valid_ends:
+    possible_ends = [float(s["end"]) for s in ordered if float(s["end"]) > aligned_start]
+    if not possible_ends:
         return None
-
-    sentence_ends = [
-        float(s["end"])
-        for s in ordered
-        if float(s["end"]) in valid_ends
-        and str(s.get("text", "")).rstrip().endswith((".", "?", "!"))
-    ]
-    model_duration = end - start
-    target_end = end if MIN_HIGHLIGHT_SECONDS <= model_duration <= MAX_HIGHLIGHT_SECONDS else aligned_start + TARGET_HIGHLIGHT_SECONDS
-    choices = sentence_ends or valid_ends
-    fitted_end = min(choices, key=lambda value: abs(value - target_end))
+    fitted_end = min(possible_ends, key=lambda value: abs(value - end))
+    if not MIN_HIGHLIGHT_SECONDS <= fitted_end - aligned_start <= MAX_HIGHLIGHT_SECONDS:
+        return None
     return aligned_start, fitted_end
 
 
@@ -204,14 +227,35 @@ def _sanitize_highlights(
             continue
 
 
+        provisional_score = max(
+            0,
+            min(
+                100,
+                _coerce_int(
+                    item.get("provisional_score", item.get("score")),
+                    default=0,
+                ),
+            ),
+        )
+        display_hook = str(
+            item.get("display_hook") or item.get("hook_sentence") or ""
+        ).strip()
+        discovery_reason = str(
+            item.get("discovery_reason") or item.get("virality_reason") or ""
+        ).strip()
         cleaned.append(
             {
                 "title": str(item.get("title") or "Untitled Highlight").strip(),
                 "start_time": start,
                 "end_time": end,
-                "score": max(0, min(100, _coerce_int(item.get("score"), default=0))),
-                "hook_sentence": str(item.get("hook_sentence") or "").strip(),
-                "virality_reason": str(item.get("virality_reason") or "").strip(),
+                "provisional_score": provisional_score,
+                "display_hook": display_hook,
+                # Compatibility aliases are retained, but neither participates
+                # in exact-range judging or deterministic final scoring.
+                "score": provisional_score,
+                "hook_sentence": display_hook,
+                "discovery_reason": discovery_reason,
+                "virality_reason": discovery_reason,
             }
         )
 
@@ -231,7 +275,10 @@ def detect_content_type(transcript: Dict, llm_fn: LLMFn = call_muapi_llm) -> Dic
 
 def build_transcript_text(transcript: Dict) -> str:
     segments = transcript.get("segments", [])
-    return "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
+    return "\n".join(
+        f"[{float(s['start']):.2f}s - {float(s['end']):.2f}s] {str(s['text']).strip()}"
+        for s in segments
+    )
 
 
 def chunk_transcript(transcript: Dict) -> List[Dict]:
@@ -270,16 +317,14 @@ def call_highlight_api(
     llm_fn: LLMFn = call_muapi_llm,
     transcript_segments: Optional[List[Dict]] = None,
 ) -> Dict:
-    # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
-    # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
-    target = max(num_clips * 2, 5)
-    natural_max = max(2 if is_chunk else 3, int(duration / 90))
-    min_clips = min(target, natural_max, 8)
+    # num_clips is the requested discovery count here, not the final quota.
+    natural_max = max(2 if is_chunk else 3, int(duration / 45))
+    candidate_count = max(1, min(num_clips, natural_max))
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
         virality_criteria=VIRALITY_CRITERIA,
         content_type=content_info.get("content_type", "other"),
         density=content_info.get("density", "medium"),
-        num_clips_instruction=f"Generate at least {min_clips} highlights",
+        candidate_count=candidate_count,
     )
     base_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     prompt = base_prompt
@@ -308,7 +353,7 @@ def call_highlight_api(
             prompt = (
                 base_prompt
                 + "\n\nIMPORTANT: Return ONLY valid JSON with a top-level 'highlights' array."
-                + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason."
+                + " Each item must include: title, start_time, end_time, provisional_score, display_hook, discovery_reason."
                 + " No markdown fences, no commentary."
             )
 
@@ -317,9 +362,234 @@ def call_highlight_api(
     )
 
 
+def calculate_final_score(scores: Dict[str, object]) -> float:
+    """Compute the transparent 0-100 score; LLM overall scores are ignored."""
+    total = 0.0
+    for component, weight in SCORE_WEIGHTS.items():
+        value = max(0.0, min(10.0, _coerce_float(scores.get(component), default=0.0)))
+        total += value * weight
+    return round(total * 10.0, 1)
+
+
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return False
+
+
+def _format_segments(segments: List[Dict]) -> List[Dict[str, object]]:
+    return [
+        {
+            "start": float(segment["start"]),
+            "end": float(segment["end"]),
+            "text": str(segment.get("text", "")).strip(),
+        }
+        for segment in segments
+    ]
+
+
+def _candidate_evidence(candidate: Dict, segments: List[Dict]) -> Dict[str, object]:
+    """Attach the exact selected transcript and immediate surrounding context."""
+    ordered = sorted(segments, key=lambda segment: float(segment["start"]))
+    start = float(candidate["start_time"])
+    end = float(candidate["end_time"])
+    selected_indexes = [
+        index
+        for index, segment in enumerate(ordered)
+        if float(segment["start"]) >= start - 1e-6
+        and float(segment["end"]) <= end + 1e-6
+    ]
+    if not selected_indexes:
+        before: List[Dict] = []
+        selected: List[Dict] = []
+        after: List[Dict] = []
+    else:
+        first = selected_indexes[0]
+        last = selected_indexes[-1]
+        before = ordered[max(0, first - 2):first]
+        selected = ordered[first:last + 1]
+        after = ordered[last + 1:last + 3]
+
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "title": candidate.get("title", ""),
+        "proposed_start_time": start,
+        "proposed_end_time": end,
+        "target_niche": TARGET_NICHE,
+        "context_before": _format_segments(before),
+        "selected_transcript": _format_segments(selected),
+        "context_after": _format_segments(after),
+    }
+
+
+def call_publishability_judge(
+    candidates: List[Dict],
+    segments: List[Dict],
+    llm_fn: LLMFn,
+) -> List[Dict]:
+    """Run one independent batch judge call over exact candidate evidence."""
+    evidence = [_candidate_evidence(candidate, segments) for candidate in candidates]
+    base_prompt = (
+        JUDGE_SYSTEM_PROMPT
+        + "\n\nCandidates and transcript evidence:\n"
+        + json.dumps(evidence, ensure_ascii=False)
+    )
+    prompt = base_prompt
+    last_error = "unknown"
+    for attempt in range(1, MAX_HIGHLIGHT_API_ATTEMPTS + 1):
+        raw = llm_fn(prompt)
+        try:
+            parsed = _parse_json_loose(raw)
+            judgments = parsed.get("judgments")
+            if isinstance(judgments, list):
+                return [item for item in judgments if isinstance(item, dict)]
+            last_error = "missing judgments array"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < MAX_HIGHLIGHT_API_ATTEMPTS:
+            prompt = base_prompt + "\n\nIMPORTANT: Return only valid JSON with a judgments array."
+    raise RuntimeError(
+        "Publishability judge produced invalid output after "
+        f"{MAX_HIGHLIGHT_API_ATTEMPTS} attempts: {last_error}"
+    )
+
+
+def _match_boundary(value: object, boundaries: List[float]) -> Optional[float]:
+    proposed = _coerce_float(value, default=float("nan"))
+    if not math.isfinite(proposed) or not boundaries:
+        return None
+    nearest = min(boundaries, key=lambda boundary: abs(boundary - proposed))
+    return nearest if abs(nearest - proposed) <= 0.05 else None
+
+
+def _obviously_incomplete_opening(text: str) -> bool:
+    """Catch only clear dangling references; nuanced cases remain judge-owned."""
+    normalized = re.sub(r'^[\s\"\'“”‘’]+', "", text).strip().lower()
+    return bool(
+        re.match(
+            r"^(?:and|but|so)\s+(?:they|he|she|it|this|that|these|those)\b",
+            normalized,
+        )
+    )
+
+
+def _apply_judgment(candidate: Dict, judgment: Dict, segments: List[Dict]) -> Dict:
+    ordered = sorted(segments, key=lambda segment: float(segment["start"]))
+    start_boundaries = [float(segment["start"]) for segment in ordered]
+    end_boundaries = [float(segment["end"]) for segment in ordered]
+    proposed_start = judgment.get("corrected_start_time", candidate["start_time"])
+    proposed_end = judgment.get("corrected_end_time", candidate["end_time"])
+    start = _match_boundary(proposed_start, start_boundaries)
+    end = _match_boundary(proposed_end, end_boundaries)
+    boundary_valid = (
+        start is not None
+        and end is not None
+        and MIN_HIGHLIGHT_SECONDS <= end - start <= MAX_HIGHLIGHT_SECONDS
+    )
+
+    selected = []
+    if boundary_valid:
+        selected = [
+            segment
+            for segment in ordered
+            if float(segment["start"]) >= start - 1e-6
+            and float(segment["end"]) <= end + 1e-6
+        ]
+        boundary_valid = bool(selected)
+
+    actual_opening_quote = (
+        str(selected[0].get("text", "")).strip() if selected else ""
+    )
+    actual_closing_quote = (
+        str(selected[-1].get("text", "")).strip() if selected else ""
+    )
+    opening_complete = (
+        boundary_valid
+        and _coerce_bool(judgment.get("opening_complete"))
+        and not _obviously_incomplete_opening(actual_opening_quote)
+    )
+    ending_complete = boundary_valid and _coerce_bool(judgment.get("ending_complete"))
+    standalone_context = boundary_valid and _coerce_bool(judgment.get("standalone_context"))
+    has_payoff = boundary_valid and _coerce_bool(judgment.get("has_payoff"))
+    publishable = (
+        _coerce_bool(judgment.get("publishable"))
+        and opening_complete
+        and ending_complete
+        and standalone_context
+        and has_payoff
+    )
+
+    raw_scores = judgment.get("scores") if isinstance(judgment.get("scores"), dict) else {}
+    scores = {
+        component: max(
+            0.0,
+            min(10.0, _coerce_float(raw_scores.get(component), default=0.0)),
+        )
+        for component in SCORE_WEIGHTS
+    }
+    final_score = calculate_final_score(scores)
+    display_hook = str(
+        judgment.get("display_hook") or candidate.get("display_hook") or ""
+    ).strip()
+    judge_reason = str(judgment.get("judge_reason") or "").strip()
+
+    result = {
+        **candidate,
+        "start_time": start if start is not None else float(candidate["start_time"]),
+        "end_time": end if end is not None else float(candidate["end_time"]),
+        "actual_opening_quote": actual_opening_quote,
+        "actual_closing_quote": actual_closing_quote,
+        "display_hook": display_hook,
+        "hook_sentence": display_hook,
+        "opening_complete": bool(opening_complete),
+        "ending_complete": bool(ending_complete),
+        "standalone_context": bool(standalone_context),
+        "has_payoff": bool(has_payoff),
+        "publishable": bool(publishable),
+        "scores": scores,
+        "final_score": final_score,
+        # score/virality_reason remain compatibility aliases for renderers/UI.
+        "score": final_score,
+        "judge_reason": judge_reason,
+        "virality_reason": judge_reason,
+        "topic_key": str(judgment.get("topic_key") or "").strip(),
+    }
+    return result
+
+
+def judge_candidates(
+    candidates: List[Dict],
+    segments: List[Dict],
+    llm_fn: LLMFn,
+) -> List[Dict]:
+    identified = [
+        {**candidate, "candidate_id": f"candidate_{index:03d}"}
+        for index, candidate in enumerate(candidates)
+    ]
+    judgments = call_publishability_judge(identified, segments, llm_fn)
+    by_id = {
+        str(judgment.get("candidate_id")): judgment
+        for judgment in judgments
+        if judgment.get("candidate_id") is not None
+    }
+    return [
+        _apply_judgment(candidate, by_id.get(candidate["candidate_id"], {}), segments)
+        for candidate in identified
+    ]
+
+
+def _ranking_score(highlight: Dict) -> float:
+    return _coerce_float(
+        highlight.get("final_score", highlight.get("score")),
+        default=0.0,
+    )
+
+
 def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     """Drop a highlight if it overlaps >50% with a higher-scoring one already kept."""
-    highlights = sorted(highlights, key=lambda x: int(x.get("score", 0)), reverse=True)
+    highlights = sorted(highlights, key=_ranking_score, reverse=True)
     kept: List[Dict] = []
     for h in highlights:
         h_start = float(h["start_time"])
@@ -338,34 +608,70 @@ def dedupe_highlights(highlights: List[Dict]) -> List[Dict]:
     return kept
 
 
+def _normalized_topic(highlight: Dict) -> str:
+    topic = str(highlight.get("topic_key") or highlight.get("title") or "").lower()
+    return " ".join(re.findall(r"[a-z0-9]+", topic))
+
+
+def rank_publishable(highlights: List[Dict], num_clips: int) -> List[Dict]:
+    """Apply hard gates, overlap dedupe, then lightweight topic diversity."""
+    ranked = dedupe_highlights([item for item in highlights if item.get("publishable")])
+    if num_clips <= 0:
+        return []
+
+    selected: List[Dict] = []
+    deferred: List[Dict] = []
+    used_topics = set()
+    for highlight in ranked:
+        topic = _normalized_topic(highlight)
+        if topic and topic in used_topics:
+            deferred.append(highlight)
+            continue
+        selected.append(highlight)
+        if topic:
+            used_topics.add(topic)
+        if len(selected) == num_clips:
+            return selected
+
+    # Reuse a topic only when there are not enough diverse publishable choices.
+    for highlight in deferred:
+        selected.append(highlight)
+        if len(selected) == num_clips:
+            break
+    return selected
+
+
 def get_highlights(
     transcript: Dict,
     num_clips: int = 3,
     llm_fn: Optional[LLMFn] = None,
 ) -> Dict:
-    """Main entry point — returns {highlights: [...]} sorted by score.
+    """Discover broadly, judge exact ranges, and return publishable finalists.
 
     `llm_fn` swaps the underlying LLM. Defaults to MuAPI gpt-5-mini; local
     mode passes in a local LLM-backed callable.
     """
     llm_fn = llm_fn or call_muapi_llm
     duration = transcript.get("duration", 0)
+    segments = transcript.get("segments", [])
+    candidate_target = min(15, max(10, num_clips * 4))
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(f"[highlights] content={content_info.get('content_type')} density={content_info.get('density')} duration={duration:.0f}s", flush=True)
 
     if duration >= LONG_VIDEO_THRESHOLD:
         chunks = chunk_transcript(transcript)
         print(f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True)
-        all_highlights: List[Dict] = []
+        candidates: List[Dict] = []
         for i, chunk in enumerate(chunks):
             offset = chunk.get("_offset", 0)
             text = build_transcript_text(chunk)
+            per_chunk_target = max(1, math.ceil(candidate_target / max(1, len(chunks))))
             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
             result = call_highlight_api(
                 text,
                 content_info,
                 chunk["duration"],
-                num_clips=num_clips,
+                num_clips=per_chunk_target,
                 is_chunk=True,
                 llm_fn=llm_fn,
                 transcript_segments=chunk["segments"],
@@ -373,18 +679,25 @@ def get_highlights(
             for h in result.get("highlights", []):
                 h["start_time"] = float(h["start_time"]) + offset
                 h["end_time"] = float(h["end_time"]) + offset
-                all_highlights.append(h)
-        highlights = dedupe_highlights(all_highlights)
+                candidates.append(h)
     else:
         text = build_transcript_text(transcript)
         result = call_highlight_api(
             text,
             content_info,
             duration,
-            num_clips=num_clips,
+            num_clips=candidate_target,
             llm_fn=llm_fn,
-            transcript_segments=transcript.get("segments", []),
+            transcript_segments=segments,
         )
-        highlights = dedupe_highlights(result.get("highlights", []))
+        candidates = result.get("highlights", [])
 
-    return {"highlights": highlights}
+    if not candidates:
+        return {"highlights": [], "candidates": []}
+
+    judged_candidates = judge_candidates(candidates, segments, llm_fn)
+    highlights = rank_publishable(judged_candidates, num_clips=num_clips)
+    return {
+        "highlights": highlights,
+        "candidates": judged_candidates,
+    }

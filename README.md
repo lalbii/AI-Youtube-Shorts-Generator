@@ -199,18 +199,18 @@ xargs -a urls.txt -I{} python main.py "{}"
 2. **Transcribe**: MuAPI `/openai-whisper` produces a timestamped transcript (verbose_json segments)
 3. **Detect content type**: An LLM classifies the video (podcast, interview, tutorial, vlog, etc.) and density, so the prompt can be tuned per content style
 4. **Long-video chunking**: Videos > 30 min are split into 20-min overlapping chunks
-5. **Highlight ranking**: An LLM scans the transcript through a virality framework — hook moments, emotional peaks, opinion bombs, revelations, conflict, quotables, story peaks, practical value — and emits ranked candidates with scores 0–100
-6. **Dedupe**: Overlapping candidates are collapsed by score (>50% overlap → keep the higher score)
-7. **Top-N selection**: The top `--num-clips` candidates are selected
-8. **Auto-crop**: Each highlight is rendered as a vertical short at the requested aspect ratio
+5. **Candidate discovery**: An LLM scans the transcript for roughly 10–15 promising ranges when three clips are requested; its provisional score is diagnostic only
+6. **Exact-range judge**: A separate LLM pass receives each selected transcript plus immediate before/after context, may propose segment-aligned boundary repairs, applies hard publishability gates, and returns component scores
+7. **Deterministic ranking**: Python computes the final score, suppresses substantial timestamp overlap, applies lightweight topic diversity, and may return fewer than requested when too few clips are publishable
+8. **Auto-crop**: Each publishable finalist is rendered at the requested aspect ratio
 
-**Output**: a list of mp4 URLs plus, for each clip, its title, viral score, hook sentence, and a one-line reason explaining why it should perform.
+**Output**: judged candidates, publishable finalists, and rendered mp4 URLs. Each judgment distinguishes verbatim opening/closing transcript quotes from optional generated display-hook copy.
 
 ## Viral Highlight Selection
 
-The current selector is transcript-only. It classifies a sample of the opening transcript by content type and density, then asks one LLM call per transcript or long-video chunk to discover moments, choose boundaries, and assign each candidate a 0–100 viral score. Long-video timestamps are made chunk-relative for selection and restored to the global timeline afterward. Candidates are normalized to transcript boundaries within 20–60 seconds, sorted by the LLM's self-reported score, and deduplicated only when their timestamp ranges overlap substantially. The pipeline renders the highest-scoring `--num-clips` candidates.
+The current V1.5 selector remains transcript-only. Content classification and long-video chunking are retained, but discovery and evaluation are separate. Discovery produces a high-recall pool and cannot decide the final ranking. One batch judge pass evaluates exact ranges against nearby context for complete openings, endings, standalone context, and payoff; only candidates passing every hard gate can become finalists. Python derives verbatim `actual_opening_quote` and `actual_closing_quote` values from transcript segments, computes the weighted `final_score`, performs overlap suppression, and prefers distinct judge-provided topic labels.
 
-This design is simple and inexpensive, and its prompt explicitly values hooks, emotional peaks, polarizing opinions, revelations, conflict, quotability, story payoff, practical value, and standalone completeness. Its main limitations are low candidate recall, uncalibrated self-scoring, coupled discovery/scoring/boundary decisions, possible position and topic-clustering bias, timestamp-only deduplication, and no access to delivery, speaker, or visual signals.
+Generated `display_hook` text is presentation metadata only. `hook_sentence` remains as its compatibility alias, but neither field is supplied as scoring evidence. The selector may return fewer than `--num-clips`. Its remaining limitations include reliance on LLM semantic judgments, lightweight string-label diversity rather than embeddings, transcript-segment boundary granularity, and no delivery, audio-emotion, speaker, or visual signals.
 
 ### Future Work: Selector V2
 
@@ -298,15 +298,21 @@ Highlights:    7 candidates → kept top 3
 {
   "source_video_url": "...",
   "transcript": { "duration": 1873.4, "segments": [...] },
-  "highlights": [ {...}, {...}, ... ],
+  "candidates": [ {...all exact-range judgments...} ],
+  "highlights": [ {...publishable finalists...} ],
   "shorts": [
     {
       "title": "...",
       "start_time": 124.3,
       "end_time": 187.6,
-      "score": 92,
-      "hook_sentence": "...",
-      "virality_reason": "...",
+      "actual_opening_quote": "verbatim first spoken segment",
+      "actual_closing_quote": "verbatim final spoken segment",
+      "display_hook": "optional generated overlay",
+      "hook_sentence": "optional generated overlay (compatibility alias)",
+      "scores": { "actual_hook_strength": 9, "standalone_clarity": 8 },
+      "final_score": 86.4,
+      "score": 86.4,
+      "judge_reason": "...",
       "clip_url": "https://.../short_1.mp4"
     }
   ]
